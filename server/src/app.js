@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import cookieParser from 'cookie-parser';
 import express from 'express';
 import helmet from 'helmet';
@@ -27,6 +31,7 @@ import { createRideService } from './services/rideService.js';
 import { loadZones } from './services/zoneService.js';
 
 const BODY_LIMIT = '100kb';
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
 /**
  * Builds the Express app. Kept separate from index.js so tests can import it. Async because it
@@ -68,6 +73,17 @@ export async function createApp({ pool, config }) {
       .status(404)
       .json({ error: { code: 'NOT_FOUND', message: 'Route not found.', details: {} } });
   });
+
+  // The built client (present only in the Docker image; local dev uses Vite's own server and
+  // proxy, per design.md section 14). Static files first, then a SPA fallback to index.html for
+  // any other GET, so client-side routes work on a direct load or refresh.
+  if (fs.existsSync(PUBLIC_DIR)) {
+    app.use(express.static(PUBLIC_DIR));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+    });
+  }
+
   app.use(errorHandler);
 
   return app;
