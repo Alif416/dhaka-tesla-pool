@@ -1,20 +1,34 @@
-import { RIDE_STATUSES } from '../domain/constants.js';
-import { computeSoloFare } from '../domain/fare.js';
+import { CANCEL_REASONS, LEFT_REASONS, POOL_STATUSES, RIDE_STATUSES } from '../domain/constants.js';
+import { computeSoloFare, computeFare, nextQuote } from '../domain/fare.js';
 import { PICKUP_EQUALS_DESTINATION, distanceUnits } from '../domain/geography.js';
 import { canPassengerCancelRide } from '../domain/stateMachine.js';
 import { ERROR_CODES } from '../lib/errorCodes.js';
 import { AppError } from '../lib/errors.js';
+import { findPaymentForPassengerRide } from '../repositories/paymentRepository.js';
 import { insertRideEvent, listEventsForPassenger } from '../repositories/rideEventRepository.js';
-import { findPoolInfoForPassengerRide } from '../repositories/poolRepository.js';
+import {
+  findActivePoolMembershipForRide,
+  findPoolInfoForPassengerRide,
+  isActiveMemberOfPool,
+  listActiveMembers,
+  lockPoolById,
+  markMemberLeft,
+  updatePoolStatus,
+} from '../repositories/poolRepository.js';
 import {
   findActiveRideForPassenger,
   findRideForPassenger,
   insertRideForPassenger,
   listRidesForPassenger,
+  lockRequestsByIds,
   lockRideForPassenger,
   markRideCancelledForPassenger,
+  updateQuote,
 } from '../repositories/rideRepository.js';
 import { getCrossDistances, getZoneById } from './zoneService.js';
+
+/** Bounded retries for the stale-discovery loop in cancelRide's pool-membership path. */
+const MAX_STALE_DISCOVERY_ATTEMPTS = 3;
 
 function resolveRoute({ pickupZoneId, destinationZoneId }) {
   const pickupZone = getZoneById(pickupZoneId);
@@ -106,7 +120,8 @@ export function createRideService({ withTx }) {
   /**
    * @param {{ id: string }} actor
    * @param {string} rideId
-   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null }>}
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null,
+   *   payment: object | null }>}
    */
   async function getRide(actor, rideId) {
     return withTx(async (tx) => {
@@ -116,14 +131,15 @@ export function createRideService({ withTx }) {
       }
       const timeline = await listEventsForPassenger(tx, actor.id, rideId);
       const poolInfo = await findPoolInfoForPassengerRide(tx, actor.id, rideId);
-      return { ride, timeline, poolInfo };
+      const payment = await findPaymentForPassengerRide(tx, actor.id, rideId);
+      return { ride, timeline, poolInfo, payment };
     });
   }
 
   /**
    * @param {{ id: string }} actor
-   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null }[]>} Current
-   *   and past rides.
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null,
+   *   payment: object | null }[]>} Current and past rides.
    */
   async function listRides(actor) {
     return withTx(async (tx) => {
@@ -132,48 +148,159 @@ export function createRideService({ withTx }) {
       for (const ride of rides) {
         const timeline = await listEventsForPassenger(tx, actor.id, ride.id);
         const poolInfo = await findPoolInfoForPassengerRide(tx, actor.id, ride.id);
-        result.push({ ride, timeline, poolInfo });
+        const payment = await findPaymentForPassengerRide(tx, actor.id, ride.id);
+        result.push({ ride, timeline, poolInfo, payment });
       }
       return result;
     });
   }
 
   /**
-   * Cancels a ride while it is `REQUESTED`. Cancelling from `MATCHED` or `DRIVER_ARRIVED` is a
-   * legal transition in the state machine, but changes pool membership too, which is not
-   * implemented until unit 08 — until then it returns 409 `INVALID_STATE` like any other
-   * disallowed state. Remove this restriction (the second `if` below) in unit 08.
+   * Cancels the passenger's own ride, from `REQUESTED`, `MATCHED` or `DRIVER_ARRIVED`
+   * (design.md section 7.2). Follows a bounded stale-discovery retry: membership is discovered
+   * without a lock first (a plain read, its own committed `withTx` call), then re-checked once
+   * the right lock is actually held. If that re-check finds discovery was stale — a concurrent
+   * accept just matched this ride into a pool discovery missed — the whole attempt retries.
    * @param {{ id: string }} actor
    * @param {string} rideId
-   * @returns {Promise<{ ride: object, timeline: object[] }>}
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null,
+   *   payment: object | null }>}
    */
   async function cancelRide(actor, rideId) {
-    return withTx(async (tx) => {
-      const ride = await lockRideForPassenger(tx, actor.id, rideId);
-      if (!ride) {
-        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
-      }
-      if (ride.status === RIDE_STATUSES.CANCELLED && ride.cancel_reason === 'PASSENGER_CANCELLED') {
-        const timeline = await listEventsForPassenger(tx, actor.id, rideId);
-        return { ride, timeline };
-      }
-      if (!canPassengerCancelRide(ride.status)) {
-        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be cancelled now.');
-      }
-      if (ride.status !== RIDE_STATUSES.REQUESTED) {
-        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be cancelled now.');
+    for (let attempt = 1; attempt <= MAX_STALE_DISCOVERY_ATTEMPTS; attempt += 1) {
+      const membership = await withTx((tx) => findActivePoolMembershipForRide(tx, rideId));
+
+      if (!membership) {
+        const outcome = await withTx(async (tx) => {
+          const ride = await lockRideForPassenger(tx, actor.id, rideId);
+          if (!ride) {
+            throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
+          }
+          if (
+            ride.status === RIDE_STATUSES.CANCELLED &&
+            ride.cancel_reason === CANCEL_REASONS.PASSENGER_CANCELLED
+          ) {
+            const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+            return { stale: false, value: { ride, timeline, poolInfo: null, payment: null } };
+          }
+          if (ride.status === RIDE_STATUSES.REQUESTED) {
+            const cancelled = await cancelUnpooledRide(tx, actor, rideId);
+            return { stale: false, value: cancelled };
+          }
+          if (
+            ride.status === RIDE_STATUSES.MATCHED ||
+            ride.status === RIDE_STATUSES.DRIVER_ARRIVED
+          ) {
+            // A concurrent accept matched this ride after our unlocked discovery ran. Retry
+            // from scratch so discovery finds the pool this time.
+            return { stale: true };
+          }
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be cancelled now.');
+        });
+        if (outcome.stale) {
+          continue;
+        }
+        return outcome.value;
       }
 
-      const cancelled = await markRideCancelledForPassenger(tx, actor.id, rideId);
-      await insertRideEvent(tx, {
-        rideRequestId: rideId,
-        actorId: actor.id,
-        eventType: 'PASSENGER_CANCELLED',
+      const outcome = await withTx(async (tx) => {
+        const pool = await lockPoolById(tx, membership.pool_id);
+        const discoveredMemberIds = (await listActiveMembers(tx, pool.id)).map((m) => m.id);
+        const idsToLock = [...new Set([rideId, ...discoveredMemberIds])];
+        const lockedRows = await lockRequestsByIds(tx, idsToLock);
+        const candidate = lockedRows.find((row) => row.id === rideId);
+        if (!candidate || candidate.passenger_id !== actor.id) {
+          // Ownership is enforced here, not by markRideCancelledForPassenger's WHERE clause
+          // alone: that would silently no-op for the wrong actor while this transaction's other
+          // writes (quote recompute, membership close) still ran, mutating another passenger's
+          // pool without ever actually cancelling their ride.
+          throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
+        }
+
+        const stillMember = await isActiveMemberOfPool(tx, pool.id, rideId);
+        if (!stillMember) {
+          // Stale discovery: cancel-pool or no-show already removed this membership between our
+          // unlocked read and this lock. Resolve directly from the now-fresh candidate row
+          // rather than looping back — we already hold everything needed.
+          if (
+            candidate.status === RIDE_STATUSES.CANCELLED &&
+            candidate.cancel_reason === CANCEL_REASONS.PASSENGER_CANCELLED
+          ) {
+            const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+            return { ride: candidate, timeline, poolInfo: null, payment: null };
+          }
+          if (candidate.status === RIDE_STATUSES.REQUESTED) {
+            return cancelUnpooledRide(tx, actor, rideId);
+          }
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be cancelled now.');
+        }
+
+        if (!canPassengerCancelRide(candidate.status) || pool.status === POOL_STATUSES.STARTED) {
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be cancelled now.');
+        }
+
+        await markMemberLeft(tx, pool.id, rideId, LEFT_REASONS.PASSENGER_CANCELLED);
+        const cancelled = await markRideCancelledForPassenger(tx, actor.id, rideId);
+        await insertRideEvent(tx, {
+          rideRequestId: rideId,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: 'PASSENGER_CANCELLED',
+        });
+
+        // Recompute quotes for whoever remains. Never rises: removing a member only ever raises
+        // the *computed* fare (fewer passengers, less discount); nextQuote keeps the quote as is.
+        const remainingMembers = lockedRows.filter(
+          (row) => row.id !== rideId && row.status !== RIDE_STATUSES.CANCELLED,
+        );
+        if (remainingMembers.length > 0) {
+          const passengerCount = remainingMembers.length;
+          for (const member of remainingMembers) {
+            const computedFarePaisa = computeFare({
+              soloFarePaisa: member.solo_fare_paisa,
+              passengerCount,
+            });
+            const quotedFarePaisa = nextQuote({
+              quotedFarePaisa: member.quoted_fare_paisa,
+              computedFarePaisa,
+            });
+            if (quotedFarePaisa !== member.quoted_fare_paisa) {
+              await updateQuote(tx, member.id, quotedFarePaisa);
+              await insertRideEvent(tx, {
+                rideRequestId: member.id,
+                actorId: actor.id,
+                poolId: pool.id,
+                eventType: 'QUOTE_UPDATED',
+                metadata: { fromPaisa: member.quoted_fare_paisa, toPaisa: quotedFarePaisa },
+              });
+            }
+          }
+        } else {
+          await updatePoolStatus(tx, pool.id, POOL_STATUSES.CANCELLED);
+        }
+
+        const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+        return { ride: cancelled, timeline, poolInfo: null, payment: null };
       });
-      const timeline = await listEventsForPassenger(tx, actor.id, rideId);
-      return { ride: cancelled, timeline };
-    });
+      return outcome;
+    }
+    throw new AppError(ERROR_CODES.BUSY, 503, 'Busy, please try again.', { retryAfter: 1 });
   }
 
   return { estimateFare, createRide, getRide, listRides, cancelRide };
+}
+
+/**
+ * Cancels a ride that is (or has just become) REQUESTED — the no-pool cancel path, shared by
+ * both branches of cancelRide's stale-discovery handling.
+ */
+async function cancelUnpooledRide(tx, actor, rideId) {
+  const cancelled = await markRideCancelledForPassenger(tx, actor.id, rideId);
+  await insertRideEvent(tx, {
+    rideRequestId: rideId,
+    actorId: actor.id,
+    eventType: 'PASSENGER_CANCELLED',
+  });
+  const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+  return { ride: cancelled, timeline, poolInfo: null, payment: null };
 }

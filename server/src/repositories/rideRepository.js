@@ -191,3 +191,23 @@ export async function updateQuote(tx, rideId, quotedFarePaisa) {
     [rideId, quotedFarePaisa],
   );
 }
+
+/**
+ * Cancels a ride with a driver-chosen reason (no-show). Unlike
+ * `markRideCancelledForPassenger`, this is not passenger-scoped: the caller (poolService) has
+ * already established ownership by locking the driver's pool and this ride within it.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} rideId
+ * @param {string} cancelReason One of `CANCEL_REASONS`.
+ * @returns {Promise<object>} The updated row.
+ */
+export async function markRideCancelledByDriver(tx, rideId, cancelReason) {
+  const { rows } = await tx.query(
+    `UPDATE ride_requests
+     SET status = 'CANCELLED', cancel_reason = $2, updated_at = now()
+     WHERE id = $1
+     RETURNING ${RIDE_COLUMNS}`,
+    [rideId, cancelReason],
+  );
+  return rows[0];
+}

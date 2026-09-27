@@ -207,3 +207,153 @@ export async function findPoolInfoForPassengerRide(tx, passengerId, rideId) {
   );
   return rows[0] ?? null;
 }
+
+/**
+ * Locks a pool by its own id, scoped to the acting driver via their vehicle. `FOR UPDATE OF p`
+ * locks only the `pools` row despite the join, the same technique unit 07's `lockActivePoolForVehicle`
+ * used with a single-table query. Used by every lifecycle command (arrive, start, cancel pool,
+ * no-show) whose route gives a pool id directly, unlike accept which starts from a vehicle id.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} driverId
+ * @param {string} poolId
+ * @returns {Promise<object | null>}
+ */
+export async function lockPoolForDriver(tx, driverId, poolId) {
+  const { rows } = await tx.query(
+    `SELECT p.id, p.vehicle_id, p.status, p.created_at, p.updated_at,
+            p.arrived_at, p.started_at, p.completed_at, p.cancelled_at
+     FROM pools p
+     JOIN vehicles v ON v.id = p.vehicle_id
+     WHERE p.id = $1 AND v.driver_id = $2
+     FOR UPDATE OF p`,
+    [poolId, driverId],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Locks a pool by its own id with no driver scoping. Used only by the passenger cancel-from-pool
+ * path, which reaches the pool through the passenger's own (already actor-scoped) membership
+ * row, not through driver ownership.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} poolId
+ * @returns {Promise<object | null>}
+ */
+export async function lockPoolById(tx, poolId) {
+  const { rows } = await tx.query(
+    `SELECT id, vehicle_id, status, created_at, updated_at,
+            arrived_at, started_at, completed_at, cancelled_at
+     FROM pools
+     WHERE id = $1
+     FOR UPDATE`,
+    [poolId],
+  );
+  return rows[0] ?? null;
+}
+
+/** Sets the one timestamp column that matches each status; the others are left untouched. */
+export async function updatePoolStatus(tx, poolId, status) {
+  const { rows } = await tx.query(
+    `UPDATE pools
+     SET status = $2::pool_status,
+         updated_at = now(),
+         arrived_at = CASE WHEN $2::text = 'DRIVER_ARRIVED' THEN now() ELSE arrived_at END,
+         started_at = CASE WHEN $2::text = 'STARTED' THEN now() ELSE started_at END,
+         completed_at = CASE WHEN $2::text = 'COMPLETED' THEN now() ELSE completed_at END,
+         cancelled_at = CASE WHEN $2::text = 'CANCELLED' THEN now() ELSE cancelled_at END
+     WHERE id = $1
+     RETURNING id, vehicle_id, status, created_at, updated_at,
+               arrived_at, started_at, completed_at, cancelled_at`,
+    [poolId, status],
+  );
+  return rows[0];
+}
+
+/**
+ * Bulk-flips every currently active member's ride status (arrive, start, or the cancel-pool
+ * requeue to REQUESTED). Safe without a prior `SELECT ... FOR UPDATE ... ORDER BY id`: every
+ * command that can touch this pool's members (accept/add, arrive, start, cancel pool, no-show,
+ * passenger cancel-from-pool) locks this same pool row first, so once it is locked nothing else
+ * in the codebase can be concurrently acting on these rows — the ascending-id lock order matters
+ * for commands racing across *different* pools/vehicles, not for this single-pool bulk update.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} poolId
+ * @param {string} status
+ * @returns {Promise<object[]>} The affected rows (full ride_requests columns), for the caller to
+ *   build events or, for start, compute payments from.
+ */
+export async function updateActiveMembersStatus(tx, poolId, status) {
+  const { rows } = await tx.query(
+    `UPDATE ride_requests r
+     SET status = $2, updated_at = now()
+     FROM pool_members pm
+     WHERE pm.pool_id = $1 AND pm.ride_request_id = r.id AND pm.left_at IS NULL
+     RETURNING r.id, r.passenger_id, r.pickup_zone_id, r.destination_zone_id, r.seats,
+               r.distance_units, r.solo_fare_paisa, r.quoted_fare_paisa, r.status,
+               r.cancel_reason, r.created_at, r.updated_at`,
+    [poolId, status],
+  );
+  return rows;
+}
+
+/**
+ * Closes one member's active membership (no-show, or the individual leg of a passenger
+ * cancel-from-pool).
+ * @param {import('pg').PoolClient} tx
+ * @param {string} poolId
+ * @param {string} rideId
+ * @param {string} reason One of `LEFT_REASONS`.
+ * @returns {Promise<void>}
+ */
+export async function markMemberLeft(tx, poolId, rideId, reason) {
+  await tx.query(
+    `UPDATE pool_members SET left_at = now(), left_reason = $3
+     WHERE pool_id = $1 AND ride_request_id = $2 AND left_at IS NULL`,
+    [poolId, rideId, reason],
+  );
+}
+
+/**
+ * Closes every active membership of a pool at once (the cancel-pool requeue). Call after the
+ * ride-status flip (`updateActiveMembersStatus`), not before — that query also filters on
+ * `left_at IS NULL`, so closing memberships first would leave it with nothing to update.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} poolId
+ * @param {string} reason One of `LEFT_REASONS`.
+ * @returns {Promise<void>}
+ */
+export async function markAllActiveMembersLeft(tx, poolId, reason) {
+  await tx.query(
+    `UPDATE pool_members SET left_at = now(), left_reason = $2
+     WHERE pool_id = $1 AND left_at IS NULL`,
+    [poolId, reason],
+  );
+}
+
+/**
+ * @param {import('pg').PoolClient} tx
+ * @param {string} poolId
+ * @returns {Promise<number>}
+ */
+export async function countActiveMembers(tx, poolId) {
+  const { rows } = await tx.query(
+    `SELECT count(*)::int AS n FROM pool_members WHERE pool_id = $1 AND left_at IS NULL`,
+    [poolId],
+  );
+  return rows[0].n;
+}
+
+/**
+ * Discovery only, not locked: which pool (if any) a ride is currently an active member of.
+ * Callers must re-check under that pool's own lock before acting on the result.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} rideId
+ * @returns {Promise<{ pool_id: string } | null>}
+ */
+export async function findActivePoolMembershipForRide(tx, rideId) {
+  const { rows } = await tx.query(
+    `SELECT pool_id FROM pool_members WHERE ride_request_id = $1 AND left_at IS NULL`,
+    [rideId],
+  );
+  return rows[0] ?? null;
+}

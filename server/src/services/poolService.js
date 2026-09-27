@@ -1,19 +1,38 @@
 import { canAnchor, canJoinPool } from '../domain/compatibility.js';
-import { COMPATIBILITY_CODES, RIDE_EVENT_TYPES, RIDE_STATUSES } from '../domain/constants.js';
+import {
+  COMPATIBILITY_CODES,
+  LEFT_REASONS,
+  POOL_STATUSES,
+  RIDE_EVENT_TYPES,
+  RIDE_STATUSES,
+} from '../domain/constants.js';
 import { computeFare, nextQuote } from '../domain/fare.js';
+import { canTransitionPool } from '../domain/stateMachine.js';
 import { ERROR_CODES } from '../lib/errorCodes.js';
 import { AppError } from '../lib/errors.js';
+import { insertPayment } from '../repositories/paymentRepository.js';
 import { insertRideEvent } from '../repositories/rideEventRepository.js';
 import {
+  findPoolForDriver,
   insertPool,
   insertPoolMember,
   isActiveMemberOfPool,
   listActiveMembers,
   listActiveMembersForDriverPool,
   lockActivePoolForVehicle,
+  lockPoolForDriver,
+  markAllActiveMembersLeft,
+  markMemberLeft,
   sumOccupiedSeats,
+  updateActiveMembersStatus,
+  updatePoolStatus,
 } from '../repositories/poolRepository.js';
-import { lockRequestsByIds, markMatched, updateQuote } from '../repositories/rideRepository.js';
+import {
+  lockRequestsByIds,
+  markMatched,
+  markRideCancelledByDriver,
+  updateQuote,
+} from '../repositories/rideRepository.js';
 import { findVehicleForDriver, lockVehicleForDriver } from '../repositories/vehicleRepository.js';
 import { toCandidateShape } from './zoneService.js';
 
@@ -180,5 +199,211 @@ export function createPoolService({ withTx }) {
     throw new AppError(ERROR_CODES.BUSY, 503, 'Busy, please try again.', { retryAfter: 1 });
   }
 
-  return { acceptRide };
+  /**
+   * Lock set: driver's pool only. Bulk-updates the pool and every active member together.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function arriveAtPool(actor, poolId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+      if (pool.status === POOL_STATUSES.DRIVER_ARRIVED) {
+        return buildDriverPoolResult(tx, actor.id, pool);
+      }
+      if (!canTransitionPool(pool.status, POOL_STATUSES.DRIVER_ARRIVED)) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This pool cannot arrive now.');
+      }
+
+      const members = await updateActiveMembersStatus(tx, pool.id, RIDE_STATUSES.DRIVER_ARRIVED);
+      for (const member of members) {
+        await insertRideEvent(tx, {
+          rideRequestId: member.id,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: RIDE_EVENT_TYPES.DRIVER_ARRIVED,
+        });
+      }
+      const updatedPool = await updatePoolStatus(tx, pool.id, POOL_STATUSES.DRIVER_ARRIVED);
+      return buildDriverPoolResult(tx, actor.id, updatedPool);
+    });
+  }
+
+  /**
+   * Lock set: driver's pool, then the member's request and the remaining active members
+   * (ascending id) — the driver-initiated counterpart of `acceptRide`'s member lock.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @param {string} rideId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function noShowMember(actor, poolId, rideId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+
+      const discoveredMemberIds = (await listActiveMembers(tx, pool.id)).map((m) => m.id);
+      const idsToLock = [...new Set([rideId, ...discoveredMemberIds])];
+      const lockedRows = await lockRequestsByIds(tx, idsToLock);
+      const target = lockedRows.find((row) => row.id === rideId);
+      if (!target) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found in this pool.');
+      }
+
+      const isStillActiveMember = await isActiveMemberOfPool(tx, pool.id, rideId);
+      if (!isStillActiveMember) {
+        if (
+          target.status === RIDE_STATUSES.CANCELLED &&
+          target.cancel_reason === 'PASSENGER_NO_SHOW'
+        ) {
+          return buildDriverPoolResult(tx, actor.id, pool);
+        }
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This member is not in the pool.');
+      }
+      if (pool.status !== POOL_STATUSES.DRIVER_ARRIVED) {
+        throw new AppError(
+          ERROR_CODES.INVALID_STATE,
+          409,
+          'No-show is only allowed after arrival.',
+        );
+      }
+
+      await markMemberLeft(tx, pool.id, rideId, LEFT_REASONS.PASSENGER_NO_SHOW);
+      await markRideCancelledByDriver(tx, rideId, 'PASSENGER_NO_SHOW');
+      await insertRideEvent(tx, {
+        rideRequestId: rideId,
+        actorId: actor.id,
+        poolId: pool.id,
+        eventType: RIDE_EVENT_TYPES.PASSENGER_NO_SHOW,
+      });
+
+      // No payment: no-show happens before start. Recompute quotes for whoever remains — since
+      // canJoinPool guarantees the pool never had members outside a 3-unit window, removing one
+      // never changes who is compatible with whom, only the discount tier.
+      const remainingMembers = lockedRows.filter(
+        (row) => row.id !== rideId && row.status === RIDE_STATUSES.DRIVER_ARRIVED,
+      );
+      if (remainingMembers.length > 0) {
+        const passengerCount = remainingMembers.length;
+        for (const member of remainingMembers) {
+          const computedFarePaisa = computeFare({
+            soloFarePaisa: member.solo_fare_paisa,
+            passengerCount,
+          });
+          const quotedFarePaisa = nextQuote({
+            quotedFarePaisa: member.quoted_fare_paisa,
+            computedFarePaisa,
+          });
+          if (quotedFarePaisa !== member.quoted_fare_paisa) {
+            await updateQuote(tx, member.id, quotedFarePaisa);
+            await insertRideEvent(tx, {
+              rideRequestId: member.id,
+              actorId: actor.id,
+              poolId: pool.id,
+              eventType: RIDE_EVENT_TYPES.QUOTE_UPDATED,
+              metadata: { fromPaisa: member.quoted_fare_paisa, toPaisa: quotedFarePaisa },
+            });
+          }
+        }
+      } else {
+        await updatePoolStatus(tx, pool.id, POOL_STATUSES.CANCELLED);
+      }
+
+      const finalPool = (await findPoolForDriver(tx, actor.id, pool.id)) ?? pool;
+      return buildDriverPoolResult(tx, actor.id, finalPool);
+    });
+  }
+
+  /**
+   * Lock set: driver's pool only. Members return to REQUESTED with their quote kept.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function cancelPool(actor, poolId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+      if (pool.status === POOL_STATUSES.CANCELLED) {
+        return buildDriverPoolResult(tx, actor.id, pool);
+      }
+      if (!canTransitionPool(pool.status, POOL_STATUSES.CANCELLED)) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This pool cannot be cancelled now.');
+      }
+
+      // Flip status to REQUESTED first, while pool_members.left_at is still NULL (this query
+      // finds active members by that column); close the memberships after.
+      const requeuedMembers = await updateActiveMembersStatus(tx, pool.id, RIDE_STATUSES.REQUESTED);
+      await markAllActiveMembersLeft(tx, pool.id, LEFT_REASONS.DRIVER_CANCELLED_POOL);
+      for (const member of requeuedMembers) {
+        await insertRideEvent(tx, {
+          rideRequestId: member.id,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: RIDE_EVENT_TYPES.REQUEUED,
+        });
+      }
+
+      const updatedPool = await updatePoolStatus(tx, pool.id, POOL_STATUSES.CANCELLED);
+      return buildDriverPoolResult(tx, actor.id, updatedPool);
+    });
+  }
+
+  /**
+   * Lock set: driver's pool only. Freezes fares into one payment row per member.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function startPool(actor, poolId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+      if (pool.status === POOL_STATUSES.STARTED) {
+        return buildDriverPoolResult(tx, actor.id, pool);
+      }
+      if (!canTransitionPool(pool.status, POOL_STATUSES.STARTED)) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This pool cannot start now.');
+      }
+
+      const members = await updateActiveMembersStatus(tx, pool.id, RIDE_STATUSES.STARTED);
+      if (members.length === 0) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'No passengers remain in this pool.');
+      }
+
+      const passengerCount = members.length;
+      for (const member of members) {
+        const uncappedFarePaisa = computeFare({
+          soloFarePaisa: member.solo_fare_paisa,
+          passengerCount,
+        });
+        await insertPayment(tx, {
+          rideRequestId: member.id,
+          poolId: pool.id,
+          uncappedFarePaisa,
+          finalFarePaisa: member.quoted_fare_paisa,
+        });
+        await insertRideEvent(tx, {
+          rideRequestId: member.id,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: RIDE_EVENT_TYPES.STARTED,
+        });
+      }
+
+      const updatedPool = await updatePoolStatus(tx, pool.id, POOL_STATUSES.STARTED);
+      return buildDriverPoolResult(tx, actor.id, updatedPool);
+    });
+  }
+
+  return { acceptRide, arriveAtPool, noShowMember, cancelPool, startPool };
 }

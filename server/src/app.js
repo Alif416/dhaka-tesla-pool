@@ -12,6 +12,7 @@ import { createLoginRateLimit } from './middleware/loginRateLimit.js';
 import { createAuthRouter } from './routes/auth.js';
 import { createDriverRouter } from './routes/driver.js';
 import { createHealthRouter } from './routes/health.js';
+import { createPoolsRouter } from './routes/pools.js';
 import {
   createFareEstimateRouter,
   createRideAcceptRouter,
@@ -58,6 +59,7 @@ export async function createApp({ pool, config }) {
   app.use('/api/rides', createRideAcceptRouter({ poolService, authenticate }));
   app.use('/api/rides', createRidesRouter({ rideService, authenticate }));
   app.use('/api/driver', createDriverRouter({ driverService, authenticate }));
+  app.use('/api/pools', createPoolsRouter({ poolService, authenticate }));
 
   app.use('/api', (req, res) => {
     res
