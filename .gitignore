@@ -1,1 +1,8 @@
 Six-File+Context+Methodology
+context
+Claude.md
+node_modules
+dist
+.env
+coverage
+*.log
