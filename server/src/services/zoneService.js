@@ -47,3 +47,20 @@ export function getZoneById(id) {
 export function getCrossDistances() {
   return cache.crossDistances;
 }
+
+/**
+ * Builds the shape `domain/compatibility.js` expects (a candidate or a pool member) from plain
+ * fields, looking up each zone by id. Shared by driverService's advisory list and poolService's
+ * accept transaction, which read status, seats and zone ids from differently-shaped rows.
+ * @param {{ status: string, seats: number, pickupZoneId: number, destinationZoneId: number }} input
+ * @returns {{ status: string, seats: number, pickupZone: object | null,
+ *   destinationZone: object | null }}
+ */
+export function toCandidateShape({ status, seats, pickupZoneId, destinationZoneId }) {
+  return {
+    status,
+    seats,
+    pickupZone: getZoneById(pickupZoneId),
+    destinationZone: getZoneById(destinationZoneId),
+  };
+}

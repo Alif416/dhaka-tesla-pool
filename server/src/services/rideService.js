@@ -5,6 +5,7 @@ import { canPassengerCancelRide } from '../domain/stateMachine.js';
 import { ERROR_CODES } from '../lib/errorCodes.js';
 import { AppError } from '../lib/errors.js';
 import { insertRideEvent, listEventsForPassenger } from '../repositories/rideEventRepository.js';
+import { findPoolInfoForPassengerRide } from '../repositories/poolRepository.js';
 import {
   findActiveRideForPassenger,
   findRideForPassenger,
@@ -105,7 +106,7 @@ export function createRideService({ withTx }) {
   /**
    * @param {{ id: string }} actor
    * @param {string} rideId
-   * @returns {Promise<{ ride: object, timeline: object[] }>}
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null }>}
    */
   async function getRide(actor, rideId) {
     return withTx(async (tx) => {
@@ -114,13 +115,15 @@ export function createRideService({ withTx }) {
         throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
       }
       const timeline = await listEventsForPassenger(tx, actor.id, rideId);
-      return { ride, timeline };
+      const poolInfo = await findPoolInfoForPassengerRide(tx, actor.id, rideId);
+      return { ride, timeline, poolInfo };
     });
   }
 
   /**
    * @param {{ id: string }} actor
-   * @returns {Promise<{ ride: object, timeline: object[] }[]>} Current and past rides.
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null }[]>} Current
+   *   and past rides.
    */
   async function listRides(actor) {
     return withTx(async (tx) => {
@@ -128,7 +131,8 @@ export function createRideService({ withTx }) {
       const result = [];
       for (const ride of rides) {
         const timeline = await listEventsForPassenger(tx, actor.id, ride.id);
-        result.push({ ride, timeline });
+        const poolInfo = await findPoolInfoForPassengerRide(tx, actor.id, ride.id);
+        result.push({ ride, timeline, poolInfo });
       }
       return result;
     });

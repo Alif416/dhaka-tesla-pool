@@ -140,3 +140,54 @@ export async function listOpenRequestsForDriver(tx, driverId, { pickupZoneId = n
   );
   return rows;
 }
+
+/**
+ * Locks a set of ride requests together, in ascending id order — the fixed lock order for any
+ * command that touches more than one `ride_requests` row (design.md section 7; `code-standards.md`
+ * section 9). Internal helper: used only after ownership of the surrounding pool/vehicle is
+ * already established (by `poolService.acceptRide`), never called directly from a route.
+ * @param {import('pg').PoolClient} tx
+ * @param {string[]} ids
+ * @returns {Promise<object[]>} The locked rows, in ascending id order. Missing ids are simply
+ *   absent from the result — the caller checks for that.
+ */
+export async function lockRequestsByIds(tx, ids) {
+  if (ids.length === 0) {
+    return [];
+  }
+  const { rows } = await tx.query(
+    `SELECT ${RIDE_COLUMNS} FROM ride_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+    [ids],
+  );
+  return rows;
+}
+
+/**
+ * @param {import('pg').PoolClient} tx
+ * @param {string} rideId
+ * @returns {Promise<object>} The updated row.
+ */
+export async function markMatched(tx, rideId) {
+  const { rows } = await tx.query(
+    `UPDATE ride_requests SET status = 'MATCHED', updated_at = now()
+     WHERE id = $1
+     RETURNING ${RIDE_COLUMNS}`,
+    [rideId],
+  );
+  return rows[0];
+}
+
+/**
+ * Writes a recomputed quote. Callers must already have applied the `min(quoted, computed)` rule
+ * (`domain/fare.js` `nextQuote`) before calling this; it does not enforce that itself.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} rideId
+ * @param {number} quotedFarePaisa
+ * @returns {Promise<void>}
+ */
+export async function updateQuote(tx, rideId, quotedFarePaisa) {
+  await tx.query(
+    `UPDATE ride_requests SET quoted_fare_paisa = $2, updated_at = now() WHERE id = $1`,
+    [rideId, quotedFarePaisa],
+  );
+}
