@@ -9,7 +9,7 @@ import { requireRole } from '../../src/middleware/requireRole.js';
 import { buildTestApp } from '../helpers/app.js';
 import { resetDb } from '../helpers/db.js';
 
-const { app, pool, config } = buildTestApp();
+const { app, pool, config } = await buildTestApp();
 
 const registerBody = { email: 'Nusrat@Example.com', password: 'correct-horse', name: 'Nusrat' };
 
@@ -96,7 +96,7 @@ describe('POST /api/auth/login', () => {
   });
 
   it('sets Secure only when COOKIE_SECURE is true', async () => {
-    const secureApp = buildTestApp({ COOKIE_SECURE: 'true' });
+    const secureApp = await buildTestApp({ COOKIE_SECURE: 'true' });
     await secureApp.pool.query('SELECT 1');
     await request(secureApp.app).post('/api/auth/register').send(registerBody);
 
