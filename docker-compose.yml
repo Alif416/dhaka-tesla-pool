@@ -19,7 +19,7 @@ services:
   migrate:
     build: .
     image: ridepool
-    command: ['node', 'src/db/migrate.js']
+    command: ['sh', '-c', 'node src/db/migrate.js && node src/db/seed.js']
     env_file: .env
     depends_on:
       db:
