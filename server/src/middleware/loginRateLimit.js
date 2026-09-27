@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 10;
@@ -14,7 +14,8 @@ export function createLoginRateLimit() {
     limit: MAX_ATTEMPTS,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => `${req.ip}:${String(req.body?.email ?? '').toLowerCase()}`,
+    keyGenerator: (req) =>
+      `${ipKeyGenerator(req.ip)}:${String(req.body?.email ?? '').toLowerCase()}`,
     handler: (req, res) => {
       res.status(429).json({
         error: {
