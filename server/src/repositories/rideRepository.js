@@ -112,3 +112,31 @@ export async function markRideCancelledForPassenger(tx, passengerId, rideId) {
   );
   return rows[0] ?? null;
 }
+
+/**
+ * Advisory list of open requests a driver could accept or add right now. Scoped by requiring
+ * the driver's own vehicle to exist (the join below), so it cannot be called without a driver
+ * context; `maxSeats` is supplied by the caller (full capacity with no pool, or the pool's
+ * remaining seats with one) since only the caller knows which case applies. Never reserves
+ * anything — accept re-checks everything under lock.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} driverId
+ * @param {{ pickupZoneId?: number | null, maxSeats: number }} filter
+ * @returns {Promise<object[]>} REQUESTED rides, oldest first, limited to 50.
+ */
+export async function listOpenRequestsForDriver(tx, driverId, { pickupZoneId = null, maxSeats }) {
+  const { rows } = await tx.query(
+    `SELECT r.id, r.passenger_id, r.pickup_zone_id, r.destination_zone_id, r.seats,
+            r.quoted_fare_paisa, r.created_at, u.name AS passenger_name
+     FROM ride_requests r
+     JOIN users u ON u.id = r.passenger_id
+     JOIN vehicles v ON v.driver_id = $1
+     WHERE r.status = 'REQUESTED'
+       AND r.seats <= $2
+       AND ($3::smallint IS NULL OR r.pickup_zone_id = $3)
+     ORDER BY r.created_at
+     LIMIT 50`,
+    [driverId, maxSeats, pickupZoneId],
+  );
+  return rows;
+}

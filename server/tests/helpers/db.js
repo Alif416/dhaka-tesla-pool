@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
+import bcrypt from 'bcrypt';
+
 const MUTABLE_TABLES = 'ride_events, payments, pool_members, pools, ride_requests, vehicles, users';
+const TEST_BCRYPT_COST = 4;
 
 /**
  * Empties every mutable table. zones and zone_distances are reference data and stay.
@@ -24,23 +27,47 @@ export async function captureError(promise) {
   throw new Error('Expected the query to be rejected');
 }
 
-export async function makeUser(pool, { role = 'PASSENGER', name = 'Test User', email } = {}) {
+/**
+ * `password`, when given, is hashed for real (low bcrypt cost) so the row can log in through
+ * `POST /api/auth/login`. Without it, the row gets a placeholder hash: fine for constraint and
+ * ownership tests, but not for anything that logs in as this user.
+ */
+export async function makeUser(
+  pool,
+  { role = 'PASSENGER', name = 'Test User', email, password } = {},
+) {
   const address = email ?? `${randomUUID()}@example.com`;
+  const passwordHash = password ? await bcrypt.hash(password, TEST_BCRYPT_COST) : 'hash';
   const { rows } = await pool.query(
-    `INSERT INTO users (email, password_hash, role, name) VALUES ($1, 'hash', $2, $3) RETURNING *`,
-    [address, role, name],
+    `INSERT INTO users (email, password_hash, role, name) VALUES ($1, $2, $3, $4) RETURNING *`,
+    [address, passwordHash, role, name],
   );
   return rows[0];
 }
 
-export async function makeVehicle(pool, { driverId, capacity = 3 } = {}) {
+export async function makeVehicle(pool, { driverId, capacity = 3, online = false } = {}) {
   const driver = driverId ? { id: driverId } : await makeUser(pool, { role: 'DRIVER' });
   const { rows } = await pool.query(
-    `INSERT INTO vehicles (driver_id, name, registration_no, capacity)
-     VALUES ($1, 'Test Tesla', $2, $3) RETURNING *`,
-    [driver.id, randomUUID(), capacity],
+    `INSERT INTO vehicles (driver_id, name, registration_no, capacity, online)
+     VALUES ($1, 'Test Tesla', $2, $3, $4) RETURNING *`,
+    [driver.id, randomUUID(), capacity, online],
   );
   return rows[0];
+}
+
+/**
+ * A driver user (with a real, loginable password) plus their vehicle, in one call.
+ * @param {import('pg').Pool} pool
+ * @param {{ email?: string, password?: string, capacity?: number, online?: boolean }} [options]
+ * @returns {Promise<{ driver: object, vehicle: object }>}
+ */
+export async function makeDriverWithVehicle(
+  pool,
+  { email, password = 'driver-test-password', capacity = 3, online = false } = {},
+) {
+  const driver = await makeUser(pool, { role: 'DRIVER', email, password });
+  const vehicle = await makeVehicle(pool, { driverId: driver.id, capacity, online });
+  return { driver: { ...driver, password }, vehicle };
 }
 
 export async function makeRideRequest(pool, overrides = {}) {
