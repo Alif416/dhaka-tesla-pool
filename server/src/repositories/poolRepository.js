@@ -60,7 +60,8 @@ export async function listActiveMembersForDriverPool(tx, driverId, poolId) {
        r.id AS ride_request_id, r.status AS ride_status, r.seats,
        r.pickup_zone_id, r.destination_zone_id, r.quoted_fare_paisa,
        u.name AS passenger_name,
-       pay.uncapped_fare_paisa, pay.final_fare_paisa, pay.status AS payment_status
+       pay.id AS payment_id, pay.uncapped_fare_paisa, pay.final_fare_paisa,
+       pay.status AS payment_status
      FROM pool_members pm
      JOIN pools p ON p.id = pm.pool_id
      JOIN vehicles v ON v.id = p.vehicle_id

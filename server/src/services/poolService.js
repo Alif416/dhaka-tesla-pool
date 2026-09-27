@@ -10,9 +10,14 @@ import { computeFare, nextQuote } from '../domain/fare.js';
 import { canTransitionPool } from '../domain/stateMachine.js';
 import { ERROR_CODES } from '../lib/errorCodes.js';
 import { AppError } from '../lib/errors.js';
-import { insertPayment } from '../repositories/paymentRepository.js';
+import {
+  findPaymentForDriver,
+  insertPayment,
+  markCashCollected,
+} from '../repositories/paymentRepository.js';
 import { insertRideEvent } from '../repositories/rideEventRepository.js';
 import {
+  countActiveMembers,
   findPoolForDriver,
   insertPool,
   insertPoolMember,
@@ -31,6 +36,7 @@ import {
   lockRequestsByIds,
   markMatched,
   markRideCancelledByDriver,
+  markRideCompleted,
   updateQuote,
 } from '../repositories/rideRepository.js';
 import { findVehicleForDriver, lockVehicleForDriver } from '../repositories/vehicleRepository.js';
@@ -405,5 +411,128 @@ export function createPoolService({ withTx }) {
     });
   }
 
-  return { acceptRide, arriveAtPool, noShowMember, cancelPool, startPool };
+  /**
+   * Lock set: driver's pool, then that one request.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @param {string} rideId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function completeRideAsDriver(actor, poolId, rideId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+      const lockedRows = await lockRequestsByIds(tx, [rideId]);
+      const target = lockedRows[0];
+      if (!target) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found in this pool.');
+      }
+
+      const isStillActiveMember = await isActiveMemberOfPool(tx, pool.id, rideId);
+      if (!isStillActiveMember) {
+        // A STARTED ride only ever leaves a pool by completing (driver, self, or End Trip); it
+        // is never cancelled or no-shown after start. So "not a member, but not missing" always
+        // means COMPLETED already, by whichever path got there first.
+        if (target.status === RIDE_STATUSES.COMPLETED) {
+          return buildDriverPoolResult(tx, actor.id, pool);
+        }
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This member is not in the pool.');
+      }
+      if (pool.status !== POOL_STATUSES.STARTED) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be completed now.');
+      }
+
+      await markMemberLeft(tx, pool.id, rideId, LEFT_REASONS.COMPLETED);
+      await markRideCompleted(tx, rideId);
+      await insertRideEvent(tx, {
+        rideRequestId: rideId,
+        actorId: actor.id,
+        poolId: pool.id,
+        eventType: RIDE_EVENT_TYPES.COMPLETED,
+      });
+
+      const remaining = await countActiveMembers(tx, pool.id);
+      const finalPool =
+        remaining === 0 ? await updatePoolStatus(tx, pool.id, POOL_STATUSES.COMPLETED) : pool;
+      return buildDriverPoolResult(tx, actor.id, finalPool);
+    });
+  }
+
+  /**
+   * Lock set: driver's pool only. Force-completes every remaining member.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} poolId
+   * @returns {Promise<object>} The driver pool shape.
+   */
+  async function endTrip(actor, poolId) {
+    return withTx(async (tx) => {
+      const pool = await lockPoolForDriver(tx, actor.id, poolId);
+      if (!pool) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Pool not found.');
+      }
+      if (pool.status === POOL_STATUSES.COMPLETED) {
+        return buildDriverPoolResult(tx, actor.id, pool);
+      }
+      if (!canTransitionPool(pool.status, POOL_STATUSES.COMPLETED)) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This pool cannot end now.');
+      }
+
+      const members = await updateActiveMembersStatus(tx, pool.id, RIDE_STATUSES.COMPLETED);
+      await markAllActiveMembersLeft(tx, pool.id, LEFT_REASONS.DRIVER_FORCE_ENDED);
+      for (const member of members) {
+        await insertRideEvent(tx, {
+          rideRequestId: member.id,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: RIDE_EVENT_TYPES.DRIVER_FORCE_ENDED,
+        });
+      }
+
+      const updatedPool = await updatePoolStatus(tx, pool.id, POOL_STATUSES.COMPLETED);
+      return buildDriverPoolResult(tx, actor.id, updatedPool);
+    });
+  }
+
+  /**
+   * Lock set: none beyond the payment row itself, reached only through the driver's own pools.
+   * @param {{ id: string }} actor Driver.
+   * @param {string} paymentId
+   * @returns {Promise<object>} The payment row.
+   */
+  async function collectCash(actor, paymentId) {
+    return withTx(async (tx) => {
+      const payment = await findPaymentForDriver(tx, actor.id, paymentId);
+      if (!payment) {
+        throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Payment not found.');
+      }
+      if (payment.status === 'CASH_COLLECTED') {
+        return payment;
+      }
+      if (payment.ride_status !== RIDE_STATUSES.COMPLETED) {
+        throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride is not complete yet.');
+      }
+
+      const updated = await markCashCollected(tx, paymentId);
+      await insertRideEvent(tx, {
+        rideRequestId: payment.ride_request_id,
+        actorId: actor.id,
+        poolId: payment.pool_id,
+        eventType: RIDE_EVENT_TYPES.CASH_COLLECTED,
+      });
+      return updated;
+    });
+  }
+
+  return {
+    acceptRide,
+    arriveAtPool,
+    noShowMember,
+    cancelPool,
+    startPool,
+    completeRideAsDriver,
+    endTrip,
+    collectCash,
+  };
 }

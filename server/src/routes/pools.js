@@ -54,5 +54,27 @@ export function createPoolsRouter({ poolService, authenticate }) {
     }),
   );
 
+  router.post(
+    '/:id/members/:rideId/complete',
+    validate({ params: poolMemberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const result = await poolService.completeRideAsDriver(
+        req.actor,
+        req.valid.params.id,
+        req.valid.params.rideId,
+      );
+      res.status(200).json(serializeDriverPool(result));
+    }),
+  );
+
+  router.post(
+    '/:id/end',
+    validate({ params: poolIdParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const result = await poolService.endTrip(req.actor, req.valid.params.id);
+      res.status(200).json(serializeDriverPool(result));
+    }),
+  );
+
   return router;
 }

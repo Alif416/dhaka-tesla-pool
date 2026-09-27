@@ -211,3 +211,21 @@ export async function markRideCancelledByDriver(tx, rideId, cancelReason) {
   );
   return rows[0];
 }
+
+/**
+ * Completes a single ride. Used by the driver-complete, passenger self-complete and End Trip
+ * paths alike; which one is recorded by the caller's `ride_events` entry and the membership's
+ * `left_reason`, not by this function.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} rideId
+ * @returns {Promise<object>} The updated row.
+ */
+export async function markRideCompleted(tx, rideId) {
+  const { rows } = await tx.query(
+    `UPDATE ride_requests SET status = 'COMPLETED', updated_at = now()
+     WHERE id = $1
+     RETURNING ${RIDE_COLUMNS}`,
+    [rideId],
+  );
+  return rows[0];
+}
