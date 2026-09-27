@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -36,5 +37,35 @@ describe('runMigrations', () => {
 
     expect(first).toEqual(['999_probe.sql']);
     expect(second).toEqual([]);
+  });
+});
+
+describe('runMigrations with the real migration files', () => {
+  const realDirectory = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../src/db/migrations',
+  );
+  const databaseName = 'ridepool_migration_check';
+
+  function urlFor(name) {
+    const url = new URL(process.env.TEST_DATABASE_URL);
+    url.pathname = `/${name}`;
+    return url.toString();
+  }
+
+  it('applies on an empty database and applies nothing on an already-migrated one', async () => {
+    await pool.query(`DROP DATABASE IF EXISTS ${databaseName}`);
+    await pool.query(`CREATE DATABASE ${databaseName}`);
+    const fresh = createPool(urlFor(databaseName));
+    try {
+      const first = await runMigrations(fresh, realDirectory);
+      const second = await runMigrations(fresh, realDirectory);
+
+      expect(first).toEqual(['001_schema.sql', '002_reference_data.sql']);
+      expect(second).toEqual([]);
+    } finally {
+      await fresh.end();
+      await pool.query(`DROP DATABASE IF EXISTS ${databaseName}`);
+    }
   });
 });
