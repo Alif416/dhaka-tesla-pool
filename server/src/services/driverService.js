@@ -1,0 +1,148 @@
+import { canAnchor, canJoinPool } from '../domain/compatibility.js';
+import { RIDE_STATUSES } from '../domain/constants.js';
+import { ERROR_CODES } from '../lib/errorCodes.js';
+import { AppError } from '../lib/errors.js';
+import {
+  findActivePoolForDriver,
+  listActiveMembersForDriverPool,
+  sumOccupiedSeats,
+} from '../repositories/poolRepository.js';
+import { listOpenRequestsForDriver } from '../repositories/rideRepository.js';
+import {
+  findVehicleForDriver,
+  lockVehicleForDriver,
+  setOnlineForDriver,
+} from '../repositories/vehicleRepository.js';
+import { getZoneById } from './zoneService.js';
+
+function toCompatibilityCandidate(row) {
+  return {
+    status: RIDE_STATUSES.REQUESTED,
+    seats: row.seats,
+    pickupZone: getZoneById(row.pickup_zone_id),
+    destinationZone: getZoneById(row.destination_zone_id),
+  };
+}
+
+/**
+ * Builds the driver service bound to one transaction runner.
+ * @param {{ withTx: (fn: (tx: unknown) => Promise<unknown>) => Promise<unknown> }} deps
+ * @returns {object}
+ */
+export function createDriverService({ withTx }) {
+  /**
+   * Lock set: vehicle only.
+   * @param {{ id: string }} actor
+   * @returns {Promise<object>} The driver's vehicle.
+   */
+  async function goOnline(actor) {
+    return withTx(async (tx) => {
+      const vehicle = await lockVehicleForDriver(tx, actor.id);
+      if (vehicle.online) {
+        return vehicle;
+      }
+      return setOnlineForDriver(tx, actor.id, true);
+    });
+  }
+
+  /**
+   * Lock set: vehicle only.
+   * @param {{ id: string }} actor
+   * @returns {Promise<object>} The driver's vehicle.
+   */
+  async function goOffline(actor) {
+    return withTx(async (tx) => {
+      const vehicle = await lockVehicleForDriver(tx, actor.id);
+      if (!vehicle.online) {
+        return vehicle;
+      }
+      const activePool = await findActivePoolForDriver(tx, actor.id);
+      if (activePool) {
+        throw new AppError(
+          ERROR_CODES.POOL_ACTIVE,
+          409,
+          'Finish or cancel your current pool first.',
+        );
+      }
+      return setOnlineForDriver(tx, actor.id, false);
+    });
+  }
+
+  /**
+   * Advisory list of requests the driver could accept or add right now. Never reserves
+   * anything; the list and accept (unit 07) share the same compatibility functions.
+   * @param {{ id: string }} actor
+   * @returns {Promise<object[]>} Raw candidate rows, for the serializer to shape.
+   */
+  async function listRequests(actor) {
+    return withTx(async (tx) => {
+      const vehicle = await findVehicleForDriver(tx, actor.id);
+      if (!vehicle.online) {
+        throw new AppError(ERROR_CODES.DRIVER_OFFLINE, 409, 'Go online first.');
+      }
+
+      const pool = await findActivePoolForDriver(tx, actor.id);
+
+      if (!pool) {
+        const candidates = await listOpenRequestsForDriver(tx, actor.id, {
+          maxSeats: vehicle.capacity,
+        });
+        return candidates.filter(
+          (candidate) =>
+            canAnchor({
+              candidate: toCompatibilityCandidate(candidate),
+              capacity: vehicle.capacity,
+            }).ok,
+        );
+      }
+
+      if (pool.status !== 'ACCEPTED') {
+        return [];
+      }
+
+      const members = await listActiveMembersForDriverPool(tx, actor.id, pool.id);
+      const occupiedSeats = await sumOccupiedSeats(tx, pool.id);
+      const candidates = await listOpenRequestsForDriver(tx, actor.id, {
+        pickupZoneId: members[0].pickup_zone_id,
+        maxSeats: vehicle.capacity - occupiedSeats,
+      });
+      const memberCandidates = members.map((member) => ({
+        status: member.ride_status,
+        seats: member.seats,
+        pickupZone: getZoneById(member.pickup_zone_id),
+        destinationZone: getZoneById(member.destination_zone_id),
+      }));
+
+      return candidates.filter(
+        (candidate) =>
+          canJoinPool({
+            candidate: toCompatibilityCandidate(candidate),
+            members: memberCandidates,
+            capacity: vehicle.capacity,
+            poolStatus: pool.status,
+            occupiedSeats,
+          }).ok,
+      );
+    });
+  }
+
+  /**
+   * @param {{ id: string }} actor
+   * @returns {Promise<{ pool: object | null, vehicle: object, members: object[],
+   *   occupiedSeats: number }>}
+   */
+  async function getCurrentPool(actor) {
+    return withTx(async (tx) => {
+      const vehicle = await findVehicleForDriver(tx, actor.id);
+      const pool = await findActivePoolForDriver(tx, actor.id);
+      if (!pool) {
+        return { pool: null, vehicle, members: [], occupiedSeats: 0 };
+      }
+      const members = await listActiveMembersForDriverPool(tx, actor.id, pool.id);
+      const occupiedSeats = await sumOccupiedSeats(tx, pool.id);
+      return { pool, vehicle, members, occupiedSeats };
+    });
+  }
+
+  return { goOnline, goOffline, listRequests, getCurrentPool };
+}

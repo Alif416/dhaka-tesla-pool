@@ -10,10 +10,12 @@ import { enforceJsonContentType } from './middleware/enforceJsonContentType.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { createLoginRateLimit } from './middleware/loginRateLimit.js';
 import { createAuthRouter } from './routes/auth.js';
+import { createDriverRouter } from './routes/driver.js';
 import { createHealthRouter } from './routes/health.js';
 import { createFareEstimateRouter, createRidesRouter } from './routes/rides.js';
 import { createZonesRouter } from './routes/zones.js';
 import { createAuthService } from './services/authService.js';
+import { createDriverService } from './services/driverService.js';
 import { createRideService } from './services/rideService.js';
 import { loadZones } from './services/zoneService.js';
 
@@ -34,6 +36,7 @@ export async function createApp({ pool, config }) {
   const authenticate = createAuthenticate({ jwtSecret: config.JWT_SECRET });
   const authService = createAuthService({ withTx, config });
   const rideService = createRideService({ withTx });
+  const driverService = createDriverService({ withTx });
   const loginRateLimit = createLoginRateLimit();
 
   app.use(pinoHttp({ logger }));
@@ -47,6 +50,7 @@ export async function createApp({ pool, config }) {
   app.use('/api/zones', createZonesRouter({ authenticate }));
   app.use('/api/fare-estimate', createFareEstimateRouter({ rideService, authenticate }));
   app.use('/api/rides', createRidesRouter({ rideService, authenticate }));
+  app.use('/api/driver', createDriverRouter({ driverService, authenticate }));
 
   app.use('/api', (req, res) => {
     res
