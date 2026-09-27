@@ -63,9 +63,15 @@ export async function makeVehicle(pool, { driverId, capacity = 3, online = false
  */
 export async function makeDriverWithVehicle(
   pool,
-  { email, password = 'driver-test-password', capacity = 3, online = false } = {},
+  {
+    email,
+    password = 'driver-test-password',
+    name = 'Test Driver',
+    capacity = 3,
+    online = false,
+  } = {},
 ) {
-  const driver = await makeUser(pool, { role: 'DRIVER', email, password });
+  const driver = await makeUser(pool, { role: 'DRIVER', email, name, password });
   const vehicle = await makeVehicle(pool, { driverId: driver.id, capacity, online });
   return { driver: { ...driver, password }, vehicle };
 }

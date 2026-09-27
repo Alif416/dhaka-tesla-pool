@@ -13,15 +13,24 @@ import {
   lockVehicleForDriver,
   setOnlineForDriver,
 } from '../repositories/vehicleRepository.js';
-import { getZoneById } from './zoneService.js';
+import { toCandidateShape } from './zoneService.js';
 
-function toCompatibilityCandidate(row) {
-  return {
+function candidateRowToShape(row) {
+  return toCandidateShape({
     status: RIDE_STATUSES.REQUESTED,
     seats: row.seats,
-    pickupZone: getZoneById(row.pickup_zone_id),
-    destinationZone: getZoneById(row.destination_zone_id),
-  };
+    pickupZoneId: row.pickup_zone_id,
+    destinationZoneId: row.destination_zone_id,
+  });
+}
+
+function memberRowToShape(member) {
+  return toCandidateShape({
+    status: member.ride_status,
+    seats: member.seats,
+    pickupZoneId: member.pickup_zone_id,
+    destinationZoneId: member.destination_zone_id,
+  });
 }
 
 /**
@@ -90,7 +99,7 @@ export function createDriverService({ withTx }) {
         return candidates.filter(
           (candidate) =>
             canAnchor({
-              candidate: toCompatibilityCandidate(candidate),
+              candidate: candidateRowToShape(candidate),
               capacity: vehicle.capacity,
             }).ok,
         );
@@ -106,17 +115,12 @@ export function createDriverService({ withTx }) {
         pickupZoneId: members[0].pickup_zone_id,
         maxSeats: vehicle.capacity - occupiedSeats,
       });
-      const memberCandidates = members.map((member) => ({
-        status: member.ride_status,
-        seats: member.seats,
-        pickupZone: getZoneById(member.pickup_zone_id),
-        destinationZone: getZoneById(member.destination_zone_id),
-      }));
+      const memberCandidates = members.map(memberRowToShape);
 
       return candidates.filter(
         (candidate) =>
           canJoinPool({
-            candidate: toCompatibilityCandidate(candidate),
+            candidate: candidateRowToShape(candidate),
             members: memberCandidates,
             capacity: vehicle.capacity,
             poolStatus: pool.status,
