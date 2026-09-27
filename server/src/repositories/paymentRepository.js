@@ -42,3 +42,43 @@ export async function findPaymentForPassengerRide(tx, passengerId, rideId) {
   );
   return rows[0] ?? null;
 }
+
+/**
+ * A payment scoped through the driver's own pools (pool -> vehicle -> driver), with the ride's
+ * current status alongside so the caller can check it is COMPLETED before collecting cash.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} driverId
+ * @param {string} paymentId
+ * @returns {Promise<object | null>}
+ */
+export async function findPaymentForDriver(tx, driverId, paymentId) {
+  const { rows } = await tx.query(
+    `SELECT pay.id, pay.ride_request_id, pay.pool_id, pay.uncapped_fare_paisa,
+            pay.final_fare_paisa, pay.subsidy_paisa, pay.status, pay.cash_collected_at,
+            pay.created_at, r.status AS ride_status
+     FROM payments pay
+     JOIN pools p ON p.id = pay.pool_id
+     JOIN vehicles v ON v.id = p.vehicle_id
+     JOIN ride_requests r ON r.id = pay.ride_request_id
+     WHERE pay.id = $1 AND v.driver_id = $2`,
+    [paymentId, driverId],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Marks a payment cash-collected. The only field this repository ever updates on a payment
+ * after creation, matching the "never updated except cash fields" rule.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} paymentId
+ * @returns {Promise<object>} The updated row.
+ */
+export async function markCashCollected(tx, paymentId) {
+  const { rows } = await tx.query(
+    `UPDATE payments SET status = 'CASH_COLLECTED', cash_collected_at = now()
+     WHERE id = $1
+     RETURNING ${PAYMENT_COLUMNS}`,
+    [paymentId],
+  );
+  return rows[0];
+}

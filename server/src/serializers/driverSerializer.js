@@ -46,7 +46,26 @@ export function serializeDriverPool({ pool, vehicle, members, occupiedSeats }) {
         kind: member.final_fare_paisa === null ? 'ESTIMATE' : 'FINAL',
       },
       uncappedFarePaisa: member.uncapped_fare_paisa ?? null,
+      paymentId: member.payment_id ?? null,
       paymentStatus: member.payment_status ?? null,
     })),
+  };
+}
+
+/**
+ * Shapes one payment for the driver who owns it (through their own pool).
+ * @param {object} payment Raw row from paymentRepository.findPaymentForDriver /
+ *   markCashCollected.
+ * @returns {object}
+ */
+export function serializeDriverPayment(payment) {
+  return {
+    id: payment.id,
+    rideId: payment.ride_request_id,
+    uncappedFarePaisa: payment.uncapped_fare_paisa,
+    finalFarePaisa: payment.final_fare_paisa,
+    subsidyPaisa: payment.subsidy_paisa,
+    status: payment.status,
+    cashCollectedAt: payment.cash_collected_at,
   };
 }

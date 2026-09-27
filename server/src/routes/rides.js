@@ -102,5 +102,14 @@ export function createRidesRouter({ rideService, authenticate }) {
     }),
   );
 
+  router.post(
+    '/:id/complete',
+    validate({ params: rideIdParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const result = await rideService.completeRide(req.actor, req.valid.params.id);
+      res.status(200).json(serializePassengerRide(result));
+    }),
+  );
+
   return router;
 }

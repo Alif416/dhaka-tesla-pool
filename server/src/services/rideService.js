@@ -7,6 +7,7 @@ import { AppError } from '../lib/errors.js';
 import { findPaymentForPassengerRide } from '../repositories/paymentRepository.js';
 import { insertRideEvent, listEventsForPassenger } from '../repositories/rideEventRepository.js';
 import {
+  countActiveMembers,
   findActivePoolMembershipForRide,
   findPoolInfoForPassengerRide,
   isActiveMemberOfPool,
@@ -23,6 +24,7 @@ import {
   lockRequestsByIds,
   lockRideForPassenger,
   markRideCancelledForPassenger,
+  markRideCompleted,
   updateQuote,
 } from '../repositories/rideRepository.js';
 import { getCrossDistances, getZoneById } from './zoneService.js';
@@ -287,7 +289,94 @@ export function createRideService({ withTx }) {
     throw new AppError(ERROR_CODES.BUSY, 503, 'Busy, please try again.', { retryAfter: 1 });
   }
 
-  return { estimateFare, createRide, getRide, listRides, cancelRide };
+  /**
+   * Self-completes the passenger's own `STARTED` ride, in case the driver forgets. Same bounded
+   * stale-discovery retry shape as cancelRide. A `STARTED` ride only ever leaves its pool by
+   * completing (driver-complete, self-complete or End Trip) — never cancelled or no-shown — so
+   * "no active membership, but not missing" always means COMPLETED already, by whichever path
+   * got there first; that is treated as an idempotent success, not an error.
+   * @param {{ id: string }} actor
+   * @param {string} rideId
+   * @returns {Promise<{ ride: object, timeline: object[], poolInfo: object | null,
+   *   payment: object | null }>}
+   */
+  async function completeRide(actor, rideId) {
+    for (let attempt = 1; attempt <= MAX_STALE_DISCOVERY_ATTEMPTS; attempt += 1) {
+      const membership = await withTx((tx) => findActivePoolMembershipForRide(tx, rideId));
+
+      if (!membership) {
+        const outcome = await withTx(async (tx) => {
+          const ride = await lockRideForPassenger(tx, actor.id, rideId);
+          if (!ride) {
+            throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
+          }
+          if (ride.status === RIDE_STATUSES.COMPLETED) {
+            const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+            const payment = await findPaymentForPassengerRide(tx, actor.id, rideId);
+            return { stale: false, value: { ride, timeline, poolInfo: null, payment } };
+          }
+          if (
+            ride.status === RIDE_STATUSES.MATCHED ||
+            ride.status === RIDE_STATUSES.DRIVER_ARRIVED ||
+            ride.status === RIDE_STATUSES.STARTED
+          ) {
+            // A concurrent arrive/start/accept changed things between our unlocked discovery
+            // and this lock. Retry from scratch.
+            return { stale: true };
+          }
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be completed now.');
+        });
+        if (outcome.stale) {
+          continue;
+        }
+        return outcome.value;
+      }
+
+      const outcome = await withTx(async (tx) => {
+        const pool = await lockPoolById(tx, membership.pool_id);
+        const lockedRows = await lockRequestsByIds(tx, [rideId]);
+        const candidate = lockedRows[0];
+        if (!candidate || candidate.passenger_id !== actor.id) {
+          throw new AppError(ERROR_CODES.NOT_FOUND, 404, 'Ride not found.');
+        }
+
+        const stillMember = await isActiveMemberOfPool(tx, pool.id, rideId);
+        if (!stillMember) {
+          if (candidate.status === RIDE_STATUSES.COMPLETED) {
+            const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+            const payment = await findPaymentForPassengerRide(tx, actor.id, rideId);
+            return { ride: candidate, timeline, poolInfo: null, payment };
+          }
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be completed now.');
+        }
+        if (candidate.status !== RIDE_STATUSES.STARTED) {
+          throw new AppError(ERROR_CODES.INVALID_STATE, 409, 'This ride cannot be completed now.');
+        }
+
+        await markMemberLeft(tx, pool.id, rideId, LEFT_REASONS.COMPLETED);
+        const completed = await markRideCompleted(tx, rideId);
+        await insertRideEvent(tx, {
+          rideRequestId: rideId,
+          actorId: actor.id,
+          poolId: pool.id,
+          eventType: 'PASSENGER_SELF_COMPLETED',
+        });
+
+        const remaining = await countActiveMembers(tx, pool.id);
+        if (remaining === 0) {
+          await updatePoolStatus(tx, pool.id, POOL_STATUSES.COMPLETED);
+        }
+
+        const timeline = await listEventsForPassenger(tx, actor.id, rideId);
+        const payment = await findPaymentForPassengerRide(tx, actor.id, rideId);
+        return { ride: completed, timeline, poolInfo: null, payment };
+      });
+      return outcome;
+    }
+    throw new AppError(ERROR_CODES.BUSY, 503, 'Busy, please try again.', { retryAfter: 1 });
+  }
+
+  return { estimateFare, createRide, getRide, listRides, cancelRide, completeRide };
 }
 
 /**
