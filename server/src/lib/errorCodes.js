@@ -1,0 +1,18 @@
+/**
+ * Machine-readable error codes. SCREAMING_SNAKE_CASE, defined once. The client switches on
+ * `code`, never on `message`. Add a code here only when a unit needs it; do not speculate.
+ */
+export const ERROR_CODES = Object.freeze({
+  UNAUTHENTICATED: 'UNAUTHENTICATED',
+  FORBIDDEN: 'FORBIDDEN',
+  NOT_FOUND: 'NOT_FOUND',
+  VALIDATION_FAILED: 'VALIDATION_FAILED',
+  MALFORMED_JSON: 'MALFORMED_JSON',
+  EMAIL_TAKEN: 'EMAIL_TAKEN',
+  ACTIVE_RIDE_EXISTS: 'ACTIVE_RIDE_EXISTS',
+  REQUEST_UNAVAILABLE: 'REQUEST_UNAVAILABLE',
+  RATE_LIMITED: 'RATE_LIMITED',
+  BUSY: 'BUSY',
+  CONSTRAINT_VIOLATION: 'CONSTRAINT_VIOLATION',
+  INTERNAL: 'INTERNAL',
+});
