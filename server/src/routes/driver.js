@@ -48,5 +48,13 @@ export function createDriverRouter({ driverService, authenticate }) {
     }),
   );
 
+  router.get(
+    '/history',
+    asyncHandler(async (req, res) => {
+      const history = await driverService.getHistory(req.actor);
+      res.status(200).json(history.map(serializeDriverPool));
+    }),
+  );
+
   return router;
 }

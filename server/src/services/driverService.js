@@ -5,6 +5,8 @@ import { AppError } from '../lib/errors.js';
 import {
   findActivePoolForDriver,
   listActiveMembersForDriverPool,
+  listAllMembersForDriverPool,
+  listPoolHistoryForDriver,
   sumOccupiedSeats,
 } from '../repositories/poolRepository.js';
 import { listOpenRequestsForDriver } from '../repositories/rideRepository.js';
@@ -148,5 +150,26 @@ export function createDriverService({ withTx }) {
     });
   }
 
-  return { goOnline, goOffline, listRequests, getCurrentPool };
+  /**
+   * Past pools (COMPLETED or CANCELLED), newest first, each with every member it ever had and
+   * their final fare and payment status.
+   * @param {{ id: string }} actor
+   * @returns {Promise<{ pool: object, vehicle: object, members: object[],
+   *   occupiedSeats: number }[]>}
+   */
+  async function getHistory(actor) {
+    return withTx(async (tx) => {
+      const vehicle = await findVehicleForDriver(tx, actor.id);
+      const pastPools = await listPoolHistoryForDriver(tx, actor.id);
+      const result = [];
+      for (const pastPool of pastPools) {
+        const members = await listAllMembersForDriverPool(tx, actor.id, pastPool.id);
+        const occupiedSeats = members.reduce((sum, member) => sum + member.seats, 0);
+        result.push({ pool: pastPool, vehicle, members, occupiedSeats });
+      }
+      return result;
+    });
+  }
+
+  return { goOnline, goOffline, listRequests, getCurrentPool, getHistory };
 }

@@ -358,3 +358,51 @@ export async function findActivePoolMembershipForRide(tx, rideId) {
   );
   return rows[0] ?? null;
 }
+
+/**
+ * Past pools (COMPLETED or CANCELLED) for the driver's history view, newest first.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} driverId
+ * @returns {Promise<object[]>}
+ */
+export async function listPoolHistoryForDriver(tx, driverId) {
+  const { rows } = await tx.query(
+    `SELECT p.id, p.status, p.created_at, p.completed_at, p.cancelled_at
+     FROM pools p
+     JOIN vehicles v ON v.id = p.vehicle_id
+     WHERE v.driver_id = $1 AND p.status IN ('COMPLETED', 'CANCELLED')
+     ORDER BY p.created_at DESC`,
+    [driverId],
+  );
+  return rows;
+}
+
+/**
+ * Every member a pool ever had, including those who have since left — unlike
+ * `listActiveMembersForDriverPool`, which only returns currently-active ones and would return
+ * nothing for a finished pool. Used for the driver's history view.
+ * @param {import('pg').PoolClient} tx
+ * @param {string} driverId
+ * @param {string} poolId
+ * @returns {Promise<object[]>} Ordered by join time.
+ */
+export async function listAllMembersForDriverPool(tx, driverId, poolId) {
+  const { rows } = await tx.query(
+    `SELECT
+       r.id AS ride_request_id, r.status AS ride_status, r.seats,
+       r.pickup_zone_id, r.destination_zone_id, r.quoted_fare_paisa,
+       u.name AS passenger_name,
+       pay.id AS payment_id, pay.uncapped_fare_paisa, pay.final_fare_paisa,
+       pay.status AS payment_status
+     FROM pool_members pm
+     JOIN pools p ON p.id = pm.pool_id
+     JOIN vehicles v ON v.id = p.vehicle_id
+     JOIN ride_requests r ON r.id = pm.ride_request_id
+     JOIN users u ON u.id = r.passenger_id
+     LEFT JOIN payments pay ON pay.ride_request_id = r.id
+     WHERE pm.pool_id = $1 AND v.driver_id = $2
+     ORDER BY pm.joined_at`,
+    [poolId, driverId],
+  );
+  return rows;
+}
