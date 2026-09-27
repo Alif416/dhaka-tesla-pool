@@ -5,7 +5,7 @@ import { createApp } from '../../src/app.js';
 import { createPool } from '../../src/db/client.js';
 import { buildTestApp } from '../helpers/app.js';
 
-const { app, pool } = buildTestApp();
+const { app, pool, config } = buildTestApp();
 
 afterAll(async () => {
   await pool.end();
@@ -22,7 +22,7 @@ describe('GET /api/health', () => {
   it('returns 503 when the database is unreachable', async () => {
     const deadPool = createPool('postgres://ridepool:ridepool@127.0.0.1:1/ridepool');
 
-    const response = await request(createApp({ pool: deadPool })).get('/api/health');
+    const response = await request(createApp({ pool: deadPool, config })).get('/api/health');
     await deadPool.end();
 
     expect(response.status).toBe(503);
